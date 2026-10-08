@@ -2,6 +2,7 @@
 
 Each game tick sends one request to Ollama's /v1/systemone endpoint:
 the board as text (state) plus a single typed Choice question (move).
+With --lookahead, one request also answers the following tick's move.
 The model's per-option probabilities are then used by a safety guard so a
 low-confidence answer that would crash can fall back to the next-best move.
 
@@ -9,12 +10,17 @@ Usage:
     python snake_jev.py --cols 20 --rows 15                # pygame window
     python snake_jev.py --cols 10 --rows 8 --headless      # console only
     python snake_jev.py --dump                             # print one request and exit
+    python snake_jev.py --headless --debug-timing          # log per-request timings
+    python snake_jev.py --compact --lookahead              # faster: shorter state, 2 moves/request
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import json
+import logging
+import math
 import random
 import sys
 import time
@@ -24,6 +30,8 @@ from dataclasses import dataclass, field
 DEFAULT_MODEL = "nimble:9b-q4_K_M" #"tev1:0.8b"
 DEFAULT_HOST = "http://localhost:11434"
 START_LENGTH = 2
+
+log = logging.getLogger("snake_jev")
 
 Point = tuple[int, int]  # (col, row); row grows downwards like screen coords
 
@@ -114,6 +122,15 @@ class Game:
             self.snake.pop()
             self.steps_since_food += 1
 
+    def state_key(self) -> tuple:
+        return (tuple(self.snake), self.food, self.heading, self.alive)
+
+    def peek(self, move: str) -> Game:
+        """Copy of the game after `move`; the real game and its RNG are untouched."""
+        future = copy.deepcopy(self)
+        future.step(move)
+        return future
+
     def render_ascii(self) -> str:
         grid = [["." for _ in range(self.cols)] for _ in range(self.rows)]
         for c, r in self.snake[1:]:
@@ -151,16 +168,26 @@ class Game:
 # --------------------------------------------------------------------------
 
 
-def build_state(game: Game, assist: bool = True) -> dict[str, str]:
+MOVE_CRITERIA = {
+    "UP": "Move the head one row up",
+    "DOWN": "Move the head one row down",
+    "LEFT": "Move the head one column left",
+    "RIGHT": "Move the head one column right",
+}
+
+
+def build_state(game: Game, assist: bool = True, compact: bool = False) -> dict[str, str]:
     # Jev accepts text only, so every value is a string.
+    # Fields that never change go first: if the server reuses a cached prompt
+    # prefix between ticks, only the dynamic tail has to be re-evaluated.
     state = {
         "rules": (
             "Classic Snake. The snake moves one cell per tick. Hitting a wall (#) or "
             "its own body ends the game. Eating food (F) grows the snake by one."
         ),
+        "legend": "H = head, S = body, T = tail, F = food, . = empty, # = wall",
         "board_size": f"{game.cols} columns x {game.rows} rows (walls not counted)",
         "board": game.render_ascii(),
-        "legend": "H = head, S = body, T = tail, F = food, . = empty, # = wall",
         "heading": f"the snake is moving {game.heading}",
         "snake_length": str(len(game.snake)),
         "head_position": f"column {game.snake[0][0]}, row {game.snake[0][1]} (0-based, row 0 at top)",
@@ -168,6 +195,11 @@ def build_state(game: Game, assist: bool = True) -> dict[str, str]:
             f"column {game.food[0]}, row {game.food[1]}" if game.food else "none"
         ),
     }
+    if compact:
+        # Prompt evaluation dominates latency and the board is (N+2)*(M+2)
+        # characters; the hints below already carry what the model acts on.
+        for key in ("legend", "board", "snake_length", "head_position", "food_position"):
+            del state[key]
     if assist:
         # Small models are weak at 2-D spatial reasoning over ASCII grids;
         # pre-computing local facts turns it into a reading task.
@@ -184,18 +216,48 @@ def build_questions() -> dict[str, dict]:
                 "Which direction should the snake's head move next? Move towards the food "
                 "and never into a wall or the snake's body."
             ),
-            "criteria": {
-                "UP": "Move the head one row up",
-                "DOWN": "Move the head one row down",
-                "LEFT": "Move the head one column left",
-                "RIGHT": "Move the head one column right",
-            },
+            "criteria": MOVE_CRITERIA,
         }
     }
 
 
-def build_request(game: Game, model: str, assist: bool = True) -> dict:
-    return {"model": model, "state": build_state(game, assist), "questions": build_questions()}
+def lookahead_branches(game: Game) -> list[str]:
+    # Only moves into a free cell: a fatal move ends the game, and eating
+    # respawns food at a random cell the model could not have seen.
+    return [m for m in MOVES if game.is_safe(m) and game.outcome(m) == "free"]
+
+
+def add_lookahead(game: Game, state: dict[str, str], questions: dict[str, dict]) -> None:
+    """Ask, in the same request, what the model would play after each possible move.
+
+    One request carries one state, so the next tick's board can't be sent
+    directly; instead the hints for each reachable next position are added
+    and one conditional question is asked per branch.
+    """
+    for m in lookahead_branches(game):
+        future = game.peek(m)
+        state[f"if_head_moves_{m}"] = (
+            f"then the snake is moving {future.heading}; {future.food_relative()}; "
+            f"next cell after that: {future.describe_moves()}"
+        )
+        questions[f"move_after_{m}"] = {
+            "type": "choice",
+            "instructions": (
+                f"Suppose the head first moves {m} (see if_head_moves_{m}). Which direction "
+                "should it move after that? Move towards the food and never into a wall "
+                "or the snake's body."
+            ),
+            "criteria": MOVE_CRITERIA,
+        }
+
+
+def build_request(
+    game: Game, model: str, assist: bool = True, compact: bool = False, lookahead: bool = False
+) -> dict:
+    state, questions = build_state(game, assist, compact), build_questions()
+    if lookahead:
+        add_lookahead(game, state, questions)
+    return {"model": model, "state": state, "questions": questions}
 
 
 # --------------------------------------------------------------------------
@@ -211,24 +273,100 @@ class Decision:
     confidence: float
     latency_ms: float
     overridden: bool
+    from_lookahead: bool = False  # answered by the previous request, no new call
+
+
+@dataclass
+class RequestTiming:
+    payload_bytes: int
+    questions: int
+    encode_ms: float
+    ttfb_ms: float  # until response headers: dominated by Ollama's prompt evaluation
+    read_ms: float
+    total_ms: float
+    server: dict  # whatever usage / *_duration fields the response carries
+
+
+def server_timing_fields(response: dict) -> dict:
+    """Usage and Ollama-style timing fields, if the response includes any."""
+    fields = {}
+    if isinstance(response.get("usage"), dict):
+        fields.update(response["usage"])
+    for key, value in response.items():
+        # Ollama's native API reports durations in nanoseconds; assumed the same here.
+        if key.endswith("_duration") and isinstance(value, (int, float)):
+            fields[key.removesuffix("_duration") + "_ms"] = round(value / 1e6, 1)
+        elif key.endswith("_count") and isinstance(value, int):
+            fields[key] = value
+    return fields
 
 
 class JevClient:
     """Minimal stdlib client for Ollama's /v1/systemone endpoint."""
 
-    def __init__(self, model: str = DEFAULT_MODEL, host: str = DEFAULT_HOST, timeout: float = 120) -> None:
+    def __init__(
+        self, model: str = DEFAULT_MODEL, host: str = DEFAULT_HOST, timeout: float = 120,
+        debug_timing: bool = False,
+    ) -> None:
         self.model = model
         self.url = host.rstrip("/") + "/v1/systemone"
         self.timeout = timeout
+        self.debug_timing = debug_timing
+        self.timings: list[RequestTiming] = []
 
     def ask(self, payload: dict) -> dict:
-        req = urllib.request.Request(
-            self.url,
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-        )
+        t0 = time.perf_counter()
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(self.url, data=data, headers={"Content-Type": "application/json"})
+        t1 = time.perf_counter()
+        # urlopen returns once the status line and headers arrive, so t2 - t1
+        # is time-to-first-byte; reading the small JSON body is separate.
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            return json.load(resp)
+            t2 = time.perf_counter()
+            body = resp.read()
+        t3 = time.perf_counter()
+        response = json.loads(body)
+        if self.debug_timing:
+            timing = RequestTiming(
+                payload_bytes=len(data),
+                questions=len(payload.get("questions", {})),
+                encode_ms=(t1 - t0) * 1000,
+                ttfb_ms=(t2 - t1) * 1000,
+                read_ms=(t3 - t2) * 1000,
+                total_ms=(t3 - t0) * 1000,
+                server=server_timing_fields(response),
+            )
+            self.timings.append(timing)
+            log.info(
+                "request #%d: payload=%dB questions=%d encode=%.1fms ttfb=%.1fms read=%.1fms "
+                "total=%.1fms server=%s",
+                len(self.timings), timing.payload_bytes, timing.questions, timing.encode_ms,
+                timing.ttfb_ms, timing.read_ms, timing.total_ms, timing.server or "-",
+            )
+        return response
+
+
+def timing_summary(timings: list[RequestTiming]) -> str:
+    if not timings:
+        return "summary: no requests"
+
+    def stats(values: list[float]) -> str:
+        ordered = sorted(values)
+
+        def pct(p: float) -> float:  # nearest-rank percentile
+            return ordered[max(0, math.ceil(p * len(ordered)) - 1)]
+
+        mean = sum(ordered) / len(ordered)
+        return f"mean={mean:.0f} p50={pct(0.5):.0f} p95={pct(0.95):.0f} max={ordered[-1]:.0f}ms"
+
+    avg_bytes = sum(t.payload_bytes for t in timings) / len(timings)
+    # The first request often includes loading the model from disk.
+    return (
+        f"summary: {len(timings)} requests, avg payload {avg_bytes:.0f}B, "
+        f"first {timings[0].total_ms:.0f}ms\n"
+        f"  total {stats([t.total_ms for t in timings])}\n"
+        f"  ttfb  {stats([t.ttfb_ms for t in timings])}"
+    )
 
 
 def choose_move(game: Game, answer: dict, guard: bool = True) -> tuple[str, bool]:
@@ -245,11 +383,44 @@ def choose_move(game: Game, answer: dict, guard: bool = True) -> tuple[str, bool
     return model_choice, False  # no safe move: doomed either way
 
 
-def decide(game: Game, client: JevClient, assist: bool, guard: bool) -> Decision:
-    t0 = time.perf_counter()
-    response = client.ask(build_request(game, client.model, assist))
-    latency_ms = (time.perf_counter() - t0) * 1000
-    answer = response["answers"]["move"]
+class Player:
+    """Turns game states into moves, reusing a lookahead answer when it applies."""
+
+    def __init__(
+        self, client: JevClient, assist: bool = True, guard: bool = True,
+        compact: bool = False, lookahead: bool = False,
+    ) -> None:
+        self.client = client
+        self.assist = assist
+        self.guard = guard
+        self.compact = compact
+        self.lookahead = lookahead
+        # (state key the answer was computed for, Choice answer)
+        self._followup: tuple[tuple, dict] | None = None
+
+    def decide(self, game: Game) -> Decision:
+        followup, self._followup = self._followup, None
+        if followup and followup[0] == game.state_key():
+            # The guard still checks it against the real board.
+            return make_decision(game, followup[1], self.guard, latency_ms=0.0, from_lookahead=True)
+
+        t0 = time.perf_counter()
+        response = self.client.ask(
+            build_request(game, self.client.model, self.assist, self.compact, self.lookahead)
+        )
+        latency_ms = (time.perf_counter() - t0) * 1000
+        answers = response["answers"]
+        decision = make_decision(game, answers["move"], self.guard, latency_ms)
+        # Keyed on the move actually played, which may be a guard override.
+        played = game.effective(decision.move)
+        if f"move_after_{played}" in answers and game.outcome(decision.move) == "free":
+            self._followup = (game.peek(decision.move).state_key(), answers[f"move_after_{played}"])
+        return decision
+
+
+def make_decision(
+    game: Game, answer: dict, guard: bool, latency_ms: float, from_lookahead: bool = False
+) -> Decision:
     move, overridden = choose_move(game, answer, guard)
     return Decision(
         move=move,
@@ -258,6 +429,7 @@ def decide(game: Game, client: JevClient, assist: bool, guard: bool) -> Decision
         confidence=float(answer.get("confidence", 0.0)),
         latency_ms=latency_ms,
         overridden=overridden,
+        from_lookahead=from_lookahead,
     )
 
 
@@ -271,30 +443,33 @@ def starved(game: Game) -> bool:
 # --------------------------------------------------------------------------
 
 
-def run_headless(game: Game, client: JevClient, args: argparse.Namespace) -> None:
-    overrides, latencies = 0, []
+def run_headless(game: Game, player: Player, args: argparse.Namespace) -> None:
+    overrides, decisions, latencies = 0, 0, []
     while game.alive and not starved(game):
-        d = decide(game, client, args.assist, args.guard)
-        latencies.append(d.latency_ms)
+        d = player.decide(game)
+        decisions += 1
+        if not d.from_lookahead:  # lookahead moves cost no request; keep them out of the average
+            latencies.append(d.latency_ms)
         overrides += d.overridden
         game.step(d.move)
         if args.verbose:
             print(game.render_ascii())
-            print(f"model={d.model_choice} played={d.move} conf={d.confidence:.2f} {d.latency_ms:.0f}ms\n")
+            took = "lookahead" if d.from_lookahead else f"{d.latency_ms:.0f}ms"
+            print(f"model={d.model_choice} played={d.move} conf={d.confidence:.2f} {took}\n")
     avg = sum(latencies) / len(latencies) if latencies else 0
     print(
-        f"score={game.score} length={len(game.snake)} decisions={len(latencies)} "
+        f"score={game.score} length={len(game.snake)} decisions={decisions} requests={len(latencies)} "
         f"guard_overrides={overrides} avg_latency={avg:.0f}ms"
     )
 
 
-def run_pygame(game: Game, client: JevClient, args: argparse.Namespace) -> None:
+def run_pygame(game: Game, player: Player, args: argparse.Namespace) -> None:
     import pygame  # imported lazily so headless mode and tests don't need it
 
     cell, hud = args.cell, 28
     pygame.init()
     screen = pygame.display.set_mode((game.cols * cell, game.rows * cell + hud))
-    pygame.display.set_caption(f"Snake x {client.model}")
+    pygame.display.set_caption(f"Snake x {player.client.model}")
     font = pygame.font.SysFont("menlo", 14)
     clock = pygame.time.Clock()
     last: Decision | None = None
@@ -309,7 +484,7 @@ def run_pygame(game: Game, client: JevClient, args: argparse.Namespace) -> None:
 
         if game.alive and not starved(game):
             # Blocking call: the game runs at the model's pace, capped by --fps.
-            last = decide(game, client, args.assist, args.guard)
+            last = player.decide(game)
             game.step(last.move)
         elif game.alive:
             game.alive = False
@@ -326,7 +501,8 @@ def run_pygame(game: Game, client: JevClient, args: argparse.Namespace) -> None:
         status = f"score {game.score}"
         if last:
             flag = " [guard]" if last.overridden else ""
-            status += f"  |  {last.move}{flag}  conf {last.confidence:.2f}  {last.latency_ms:.0f} ms"
+            took = "lookahead" if last.from_lookahead else f"{last.latency_ms:.0f} ms"
+            status += f"  |  {last.move}{flag}  conf {last.confidence:.2f}  {took}"
         if not game.alive:
             status += "  |  GAME OVER - R to restart, Esc to quit"
         screen.blit(font.render(status, True, (220, 220, 220)), (8, 6))
@@ -352,20 +528,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--fps", type=int, default=10)
     p.add_argument("--cell", type=int, default=28, help="pixel size of a cell")
     p.add_argument("--seed", type=int)
-    return p.parse_args(argv)
+    p.add_argument("--debug-timing", action="store_true",
+                   help="log timing for every Ollama request to stderr, and a summary at exit")
+    p.add_argument("--compact", action="store_true",
+                   help="drop the ASCII board and fields the hints already cover (shorter prompt)")
+    p.add_argument("--lookahead", action="store_true",
+                   help="also ask for the follow-up move of each branch: up to 2 moves per request")
+    args = p.parse_args(argv)
+    # Both rely on the pre-computed hints to describe the position.
+    for flag in ("compact", "lookahead"):
+        if getattr(args, flag) and not args.assist:
+            p.error(f"--{flag} needs the hints; it can't be combined with --no-assist")
+    return args
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     game = Game(args.cols, args.rows, rng=random.Random(args.seed))
-    client = JevClient(args.model, args.host)
+    if args.debug_timing:
+        logging.basicConfig(level=logging.INFO, format="[timing] %(message)s", stream=sys.stderr)
+    client = JevClient(args.model, args.host, debug_timing=args.debug_timing)
     if args.dump:
-        print(json.dumps(build_request(game, args.model, args.assist), indent=2))
+        print(json.dumps(build_request(game, args.model, args.assist, args.compact, args.lookahead), indent=2))
         return
+    player = Player(client, args.assist, args.guard, args.compact, args.lookahead)
     try:
-        (run_headless if args.headless else run_pygame)(game, client, args)
+        (run_headless if args.headless else run_pygame)(game, player, args)
     except OSError as exc:  # URLError subclasses OSError
         sys.exit(f"Could not reach Ollama at {client.url}: {exc}. Is `ollama serve` running?")
+    finally:
+        if args.debug_timing:
+            log.info(timing_summary(client.timings))
 
 
 if __name__ == "__main__":

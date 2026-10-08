@@ -37,6 +37,9 @@ python3 snake_jev.py --cols 20 --rows 15
 | `--fps` | 10 | Upper limit on ticks per second (the model's speed is usually the real limit) |
 | `--cell` | 28 | Size of one cell in pixels |
 | `--seed` | random | Fixes food placement so runs can be repeated |
+| `--debug-timing` | off | Log the timing of every Ollama request to stderr, plus a summary at exit |
+| `--compact` | off | Leave out the ASCII board and the fields the hints already give, for a shorter prompt |
+| `--lookahead` | off | Get up to 2 moves from each request (see [Speed](#speed)) |
 
 In the window, **R** restarts after game over and **Esc** quits.
 
@@ -64,9 +67,9 @@ Jev only accepts text, so every value in `state` is a string. This is the first 
   "model": "tev1:0.8b",
   "state": {
     "rules": "Classic Snake. The snake moves one cell per tick. Hitting a wall (#) or its own body ends the game. Eating food (F) grows the snake by one.",
+    "legend": "H = head, S = body, T = tail, F = food, . = empty, # = wall",
     "board_size": "8 columns x 6 rows (walls not counted)",
     "board": "##########\n#........#\n#F.......#\n#........#\n#...TH...#\n#........#\n#........#\n##########",
-    "legend": "H = head, S = body, T = tail, F = food, . = empty, # = wall",
     "heading": "the snake is moving RIGHT",
     "snake_length": "2",
     "head_position": "column 4, row 3 (0-based, row 0 at top)",
@@ -111,6 +114,31 @@ The response looks like this:
 - **How it scales with N × M:** the `board` field is (N+2)·(M+2) characters, so the input grows with board area. Everything else stays the same size.
 - **Hints:** `food_relative_to_head` and `next_cell` are worked out by the game, not the model. Small models are weak at reading positions off an ASCII grid; the hints turn the task into reading a sentence. `--no-assist` removes them.
 
+## Speed
+
+The model's output is only a few tokens, so almost all the time per request goes on reading the prompt. These options let you measure that and cut it down:
+
+- **`--debug-timing`** logs one line per request:
+  - payload size and number of questions
+  - time to encode the request
+  - time to first byte (`ttfb`), which is mostly Ollama reading the prompt
+  - time to read the body, and the total
+  - any `usage` or `*_duration` fields in the response (durations are assumed to be nanoseconds, as in Ollama's native API)
+
+  At exit it prints the mean, p50, p95 and max. If the first request is much slower than the rest, the model was loading from disk.
+- **Order of the state fields.** The fields that never change (`rules`, `legend`, `board_size`) come first. If the server reuses a cached prompt prefix, only the changing part is read again on each tick. This depends on `/v1/systemone` keeping the key order, which hasn't been checked yet.
+- **`--compact`** leaves out `board`, `legend`, `snake_length`, `head_position` and `food_position`. The hints already cover them. This changes how big the state is as the board grows: from about N·M characters to a fixed size (on 20×15, 1535 B → 905 B). The model might play worse without the board, so compare scores with and without it.
+- **`--lookahead`** gets up to 2 moves from each request:
+  - A request has only one `state`, so the next tick's board can't be sent ahead of time.
+  - Instead, the request adds the hints for each position the snake can move into next (`if_head_moves_UP`, …) and asks one more Choice question for each (`move_after_UP`, …), so up to 4 questions in total.
+  - The answer for the move actually played (including a guard override) is used on the next tick without a new request, and the guard checks it again first.
+  - It isn't used if the snake ate, because the new food appears somewhere the model didn't know about.
+
+  Each request is larger, so check with `--debug-timing` whether it saves time overall. Moves taken from the lookahead show as `lookahead` instead of a time in milliseconds.
+- **Keep the model loaded.** Ollama unloads a model after 5 minutes without use. On macOS, run `launchctl setenv OLLAMA_KEEP_ALIVE -1` and restart the Ollama app.
+
+`--compact` and `--lookahead` both rely on the hints, so neither can be combined with `--no-assist`.
+
 ## Findings with `tev1:0.8b`
 
 Measured on Ollama 0.35.1 with a 10×8 board:
@@ -136,7 +164,7 @@ UP/DOWN/LEFT/RIGHT likely works better because the answer options then use the s
 | File | Contents |
 |---|---|
 | `snake_jev.py` | Game logic, query building, Ollama client, guard, PyGame and headless front ends |
-| `test_snake_jev.py` | Unit tests for game rules, request shape and guard behaviour |
+| `test_snake_jev.py` | Unit tests for game rules, request shape, guard, lookahead and timing |
 | `requirements.txt` | `pygame-ce` |
 
 ## References
