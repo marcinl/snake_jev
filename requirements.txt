@@ -1,0 +1,3 @@
+# pygame-ce, not pygame: pygame 2.6.1 has no Python 3.14 wheel and its
+# source build silently drops the font module without SDL_ttf.
+pygame-ce>=2.5.8

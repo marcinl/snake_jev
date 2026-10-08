@@ -1,0 +1,9 @@
+# This directory doubles as the virtualenv; ignore its parts, track the project.
+bin/
+include/
+lib/
+pyvenv.cfg
+CACHEDIR.TAG
+__pycache__/
+.DS_Store
+*.zip
