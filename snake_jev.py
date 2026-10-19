@@ -27,8 +27,10 @@ import time
 import urllib.request
 from dataclasses import dataclass, field
 
-DEFAULT_MODEL = "nimble:9b-q4_K_M" #"tev1:0.8b"
-DEFAULT_HOST = "http://localhost:11434"
+DEFAULT_MODEL = "basal-2.0-mini:q8_0" # "nimble:9b-q4_K_M"
+DEFAULT_HOST = "http://localhost:8000"
+#DEFAULT_HOST = "http://localhost:11434"
+#DEFAULT_HOST = "http://localhost:49935"
 START_LENGTH = 2
 
 log = logging.getLogger("snake_jev")
