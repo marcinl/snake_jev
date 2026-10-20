@@ -1,0 +1,135 @@
+{
+ "prompt": 2,
+ "orders": 1,
+ "method": "temperature per question type and per option-count bucket (choice), by NLL, fitted on the out-of-distribution calibration split only; thresholds per type: the most permissive threshold whose accepted calibration decisions have a one-sided 95% Clopper-Pearson upper bound <= max_error; a type without one defers",
+ "temperature_per_prim": {
+  "choice": 1.6817928305074288,
+  "noul": 1.8340080864093422,
+  "score": 1.9430638823072113
+ },
+ "temperature_per_bucket": {
+  "choice": {
+   "2-10": 1.7062550705226853,
+   "11-26": 0.9856631986401876
+  }
+ },
+ "thresholds": {
+  "0.01": {
+   "confidence": null,
+   "method": "per type: the most permissive threshold whose accepted calibration decisions have a one-sided 95% Clopper-Pearson upper bound <= max_error; a type without one defers",
+   "per_type": {
+    "choice": {
+     "confidence": null,
+     "heldout_coverage": 0.0,
+     "heldout_error": null
+    },
+    "noul": {
+     "confidence": null,
+     "heldout_coverage": 0.0,
+     "heldout_error": null
+    },
+    "score": {
+     "confidence": null,
+     "heldout_coverage": 0.0,
+     "heldout_error": null
+    }
+   },
+   "heldout_coverage": 0.0,
+   "heldout_error": null
+  },
+  "0.05": {
+   "confidence": null,
+   "method": "per type: the most permissive threshold whose accepted calibration decisions have a one-sided 95% Clopper-Pearson upper bound <= max_error; a type without one defers",
+   "per_type": {
+    "choice": {
+     "confidence": 0.9714394359452563,
+     "heldout_coverage": 0.1201170889270213,
+     "heldout_error": 0.007563025210084007
+    },
+    "noul": {
+     "confidence": 0.9104032498264746,
+     "heldout_coverage": 0.178240302743614,
+     "heldout_error": 0.03397027600849256
+    },
+    "score": {
+     "confidence": null,
+     "heldout_coverage": 0.0,
+     "heldout_error": null
+    }
+   },
+   "heldout_coverage": 0.11733626857457348,
+   "heldout_error": 0.019230769230769273
+  }
+ },
+ "gates": {
+  "ece_lofo": {
+   "choice": {
+    "pooled": 0.04382642570009307,
+    "n": 9907,
+    "gate": 0.05,
+    "pass": true
+   },
+   "noul": {
+    "pooled": 0.021173379790233322,
+    "n": 5285,
+    "gate": 0.05,
+    "pass": true
+   },
+   "score": {
+    "pooled": 0.026608396632200416,
+    "n": 2978,
+    "gate": 0.05,
+    "pass": true
+   }
+  },
+  "ece_worst_fold": 0.09287502891297494,
+  "worst_fold": "s2",
+  "automated_at": {
+   "0.01": 0.0,
+   "0.05": 0.11733626857457348
+  },
+  "automated_error": {
+   "0.01": null,
+   "0.05": 0.019230769230769273
+  },
+  "note": "held-out numbers: every evaluation row predicted by the fit without its family"
+ },
+ "test": {
+  "T": {
+   "choice": {
+    "acc": 0.7281719995962451,
+    "ece": 0.04267974297052057,
+    "n": 9907
+   },
+   "noul": {
+    "acc": 0.7530747398297067,
+    "ece": 0.022858203086085424,
+    "n": 5285
+   },
+   "score": {
+    "acc": 0.5268636668905305,
+    "ece": 0.02625739350630461,
+    "n": 2978
+   },
+   "all": {
+    "acc": 0.702421574023115,
+    "ece": 0.026544441171078553,
+    "n": 18170
+   }
+  },
+  "note": "evaluation pool (development and test splits), full fit"
+ },
+ "n": {
+  "fit": 2799,
+  "many": 8,
+  "eval": 18170
+ },
+ "engine": "fast",
+ "fitted_on": {
+  "split": "out-of-distribution calibration split (sealed-seed BH-, JDI- and agent-shaped families, many-option items)",
+  "orders": 1,
+  "readouts": "basal-serve --mode ollama, Ollama 0.40.2 on GGUF Q8_0 (items with <= 20 options)"
+ },
+ "certified_on": "the same split",
+ "evaluated_on": "development and test splits, leave-one-family-out and leave-one-language-out"
+}

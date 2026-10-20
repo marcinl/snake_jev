@@ -1,0 +1,10 @@
+# basal-2.0-mini (Q5_K_M) for Ollama. basal is a typed-decision model, not a chat model: the basal engine
+# (basal-serve --mode ollama --ollama-model basal-2.0-mini:q5_k_m --model <this folder or its Hugging Face repo>) renders the prompt
+# (prompt format 2) with the model's own template and answer prefill, sends it with "raw": true and reads the
+# log-probabilities of the option codes of ONE generated token. The template below only passes the prompt through.
+FROM ./basal-2.0-mini-Q5_K_M.gguf
+TEMPLATE """{{ .Prompt }}"""
+PARAMETER temperature 0
+PARAMETER num_predict 1
+PARAMETER num_ctx 8192
+PARAMETER stop "<|im_end|>"

@@ -1,0 +1,15 @@
+{
+ "name": "basal-2.0-mini",
+ "prompt": 2,
+ "readout": {
+  "kind": "code logits",
+  "codes": 255,
+  "prefill": "{\"answer\": \"",
+  "templates": "prompt format 2 (docs/FORMAT2.md of the basal engine)"
+ },
+ "calibration": "CALIBRATION.json (per-type and per-bucket temperatures, certified thresholds)",
+ "test_metrics": {
+  "acc": 0.8232476635514019,
+  "n_items": 8560
+ }
+}
