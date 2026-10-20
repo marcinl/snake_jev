@@ -6,7 +6,7 @@ import unittest
 from unittest import mock
 
 from snake_jev import (
-    Game, JevClient, Player, build_request, choose_move, parse_args, timing_summary,
+    Game, JevClient, Player, break_loop, build_request, choose_move, parse_args, timing_summary,
 )
 
 
@@ -250,6 +250,68 @@ class GuardTests(unittest.TestCase):
         # LEFT is a reverse, so the guard skips it and takes DOWN.
         self.assertEqual(choose_move(g, answer), ("DOWN", True))
         self.assertEqual(choose_move(g, answer, guard=False), ("RIGHT", False))
+
+
+CLOCKWISE = {"RIGHT": "DOWN", "DOWN": "LEFT", "LEFT": "UP", "UP": "RIGHT"}
+
+
+class CirclingClient(FakeClient):
+    """Always turns clockwise: a length-2 snake circles a 2x2 square forever."""
+
+    def __init__(self) -> None:
+        super().__init__({})
+
+    def ask(self, payload: dict) -> dict:
+        self.calls += 1
+        heading = payload["state"]["heading"].split()[-1]
+        return {"answers": {"move": answer(CLOCKWISE[heading])}}
+
+
+class LoopBreakTests(unittest.TestCase):
+    def test_no_change_when_next_position_is_new(self) -> None:
+        g = make_game()
+        self.assertIsNone(break_loop(g, answer("UP"), "UP", {g.state_key(): 1}))
+
+    def test_picks_next_ranked_safe_unvisited_move(self) -> None:
+        g = make_game()
+        g.food = (0, 0)
+        ranked = {"choice": "UP", "probabilities": {"UP": 0.5, "LEFT": 0.3, "DOWN": 0.15, "RIGHT": 0.05}}
+        seen = {g.peek("UP").state_key(): 1}
+        # LEFT is a reverse, so DOWN is the best exit.
+        self.assertEqual(break_loop(g, ranked, "UP", seen), "DOWN")
+
+    def test_picks_least_visited_when_every_exit_revisits(self) -> None:
+        g = make_game()
+        g.food = (0, 0)
+        seen = {g.peek("UP").state_key(): 3, g.peek("DOWN").state_key(): 2, g.peek("RIGHT").state_key(): 1}
+        self.assertEqual(break_loop(g, answer("UP"), "UP", seen), "RIGHT")
+
+    def test_keeps_move_when_it_is_already_least_visited(self) -> None:
+        g = make_game()
+        g.food = (0, 0)
+        seen = {g.peek(m).state_key(): 1 for m in ("UP", "DOWN", "RIGHT")}
+        self.assertIsNone(break_loop(g, answer("UP"), "UP", seen))
+
+    def test_player_escapes_circling_and_eats(self) -> None:
+        g = make_game(10, 8)
+        g.food = (0, 0)
+        player = Player(CirclingClient())
+        breaks = 0
+        while g.alive and g.score == 0 and g.steps_since_food < 500:
+            d = player.decide(g)
+            breaks += d.loop_broken
+            g.step(d.move)
+        self.assertEqual(g.score, 1)
+        self.assertGreater(breaks, 0)
+
+    def test_disabled_repeats_the_cycle(self) -> None:
+        g = make_game(10, 8)
+        g.food = (0, 0)
+        start = g.state_key()
+        player = Player(CirclingClient(), loop_break=False)
+        for _ in range(4):
+            g.step(player.decide(g).move)
+        self.assertEqual(g.state_key(), start)
 
 
 if __name__ == "__main__":

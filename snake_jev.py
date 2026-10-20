@@ -276,6 +276,7 @@ class Decision:
     latency_ms: float
     overridden: bool
     from_lookahead: bool = False  # answered by the previous request, no new call
+    loop_broken: bool = False  # move replaced by a less-visited one to leave a cycle
 
 
 @dataclass
@@ -385,26 +386,49 @@ def choose_move(game: Game, answer: dict, guard: bool = True) -> tuple[str, bool
     return model_choice, False  # no safe move: doomed either way
 
 
+def break_loop(game: Game, answer: dict, move: str, seen: dict[tuple, int]) -> str | None:
+    """If `move` re-enters a position in `seen` (visit counts), the safe move into the
+    least-visited position, ties going to the model's ranking; None to keep `move`."""
+    # The model answers a position the same way every time, so re-entering
+    # one replays the whole cycle forever. Least-visited rather than unvisited:
+    # when every exit has been seen, the snake still drifts out of the loop.
+    if seen.get(game.peek(move).state_key(), 0) == 0:
+        return None
+    ranked = sorted(MOVES, key=lambda m: float(answer["probabilities"].get(m, 0.0)), reverse=True)
+    exits = [m for m in ranked if game.is_safe(m)]
+    if not exits:
+        return None
+    best = min(exits, key=lambda m: seen.get(game.peek(m).state_key(), 0))  # min keeps the first of ties
+    return None if game.effective(best) == game.effective(move) else best
+
+
 class Player:
     """Turns game states into moves, reusing a lookahead answer when it applies."""
 
     def __init__(
         self, client: JevClient, assist: bool = True, guard: bool = True,
-        compact: bool = False, lookahead: bool = False,
+        compact: bool = False, lookahead: bool = False, loop_break: bool = True,
     ) -> None:
         self.client = client
         self.assist = assist
         self.guard = guard
         self.compact = compact
         self.lookahead = lookahead
+        self.loop_break = loop_break
         # (state key the answer was computed for, Choice answer)
         self._followup: tuple[tuple, dict] | None = None
+        self._seen: dict[tuple, int] = {}  # visits per position since the last food (or game start)
 
     def decide(self, game: Game) -> Decision:
+        if game.steps_since_food == 0:
+            self._seen.clear()
+        key = game.state_key()
+        self._seen[key] = self._seen.get(key, 0) + 1
+        seen = self._seen if self.loop_break else None
         followup, self._followup = self._followup, None
         if followup and followup[0] == game.state_key():
             # The guard still checks it against the real board.
-            return make_decision(game, followup[1], self.guard, latency_ms=0.0, from_lookahead=True)
+            return make_decision(game, followup[1], self.guard, latency_ms=0.0, from_lookahead=True, seen=seen)
 
         t0 = time.perf_counter()
         response = self.client.ask(
@@ -412,8 +436,8 @@ class Player:
         )
         latency_ms = (time.perf_counter() - t0) * 1000
         answers = response["answers"]
-        decision = make_decision(game, answers["move"], self.guard, latency_ms)
-        # Keyed on the move actually played, which may be a guard override.
+        decision = make_decision(game, answers["move"], self.guard, latency_ms, seen=seen)
+        # Keyed on the move actually played, which may be a guard or loop override.
         played = game.effective(decision.move)
         if f"move_after_{played}" in answers and game.outcome(decision.move) == "free":
             self._followup = (game.peek(decision.move).state_key(), answers[f"move_after_{played}"])
@@ -421,17 +445,20 @@ class Player:
 
 
 def make_decision(
-    game: Game, answer: dict, guard: bool, latency_ms: float, from_lookahead: bool = False
+    game: Game, answer: dict, guard: bool, latency_ms: float, from_lookahead: bool = False,
+    seen: dict[tuple, int] | None = None,
 ) -> Decision:
     move, overridden = choose_move(game, answer, guard)
+    escape = break_loop(game, answer, move, seen) if seen is not None else None
     return Decision(
-        move=move,
+        move=escape or move,
         model_choice=answer["choice"],
         probabilities={k: float(v) for k, v in answer["probabilities"].items()},
         confidence=float(answer.get("confidence", 0.0)),
         latency_ms=latency_ms,
         overridden=overridden,
         from_lookahead=from_lookahead,
+        loop_broken=escape is not None,
     )
 
 
@@ -446,13 +473,14 @@ def starved(game: Game) -> bool:
 
 
 def run_headless(game: Game, player: Player, args: argparse.Namespace) -> None:
-    overrides, decisions, latencies = 0, 0, []
+    overrides, loop_breaks, decisions, latencies = 0, 0, 0, []
     while game.alive and not starved(game):
         d = player.decide(game)
         decisions += 1
         if not d.from_lookahead:  # lookahead moves cost no request; keep them out of the average
             latencies.append(d.latency_ms)
         overrides += d.overridden
+        loop_breaks += d.loop_broken
         game.step(d.move)
         if args.verbose:
             print(game.render_ascii())
@@ -461,7 +489,7 @@ def run_headless(game: Game, player: Player, args: argparse.Namespace) -> None:
     avg = sum(latencies) / len(latencies) if latencies else 0
     print(
         f"score={game.score} length={len(game.snake)} decisions={decisions} requests={len(latencies)} "
-        f"guard_overrides={overrides} avg_latency={avg:.0f}ms"
+        f"guard_overrides={overrides} loop_breaks={loop_breaks} avg_latency={avg:.0f}ms"
     )
 
 
@@ -502,7 +530,7 @@ def run_pygame(game: Game, player: Player, args: argparse.Namespace) -> None:
 
         status = f"score {game.score}"
         if last:
-            flag = " [guard]" if last.overridden else ""
+            flag = " [loop]" if last.loop_broken else " [guard]" if last.overridden else ""
             took = "lookahead" if last.from_lookahead else f"{last.latency_ms:.0f} ms"
             status += f"  |  {last.move}{flag}  conf {last.confidence:.2f}  {took}"
         if not game.alive:
@@ -524,6 +552,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="send only the raw board, no pre-computed hints")
     p.add_argument("--no-guard", dest="guard", action="store_false",
                    help="always play the model's top choice, even if fatal")
+    p.add_argument("--no-loop-break", dest="loop_break", action="store_false",
+                   help="let the snake re-enter positions visited since the last food")
     p.add_argument("--headless", action="store_true")
     p.add_argument("--verbose", action="store_true", help="headless: print every frame")
     p.add_argument("--dump", action="store_true", help="print the first request JSON and exit")
@@ -553,7 +583,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.dump:
         print(json.dumps(build_request(game, args.model, args.assist, args.compact, args.lookahead), indent=2))
         return
-    player = Player(client, args.assist, args.guard, args.compact, args.lookahead)
+    player = Player(client, args.assist, args.guard, args.compact, args.lookahead, args.loop_break)
     try:
         (run_headless if args.headless else run_pygame)(game, player, args)
     except OSError as exc:  # URLError subclasses OSError

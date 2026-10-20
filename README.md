@@ -31,6 +31,7 @@ python3 snake_jev.py --cols 20 --rows 15
 | `--host` | `http://localhost:11434` | Ollama server |
 | `--no-assist` | off | Send only the raw board, without the hints the game works out |
 | `--no-guard` | off | Always play the model's top choice, even if it crashes |
+| `--no-loop-break` | off | Let the snake return to positions it has already been in since it last ate |
 | `--headless` | off | Console only, no PyGame window; prints a summary line |
 | `--verbose` | off | Headless: print every frame and decision |
 | `--dump` | off | Print the request for the first tick and exit |
@@ -54,7 +55,8 @@ python3 -m unittest -v
 1. **Game logic (no model involved).** An N columns × M rows grid. The snake starts with length 2, with its head at `(N//2, M//2)`, its tail one cell to the left, and heading RIGHT. Food spawns on a random free cell. Reverse moves are ignored, as in classic Snake.
 2. **Each game tick.** Build a text description of the board, send one `POST /v1/systemone` request, and get back a typed `choice` answer.
 3. **Safety check ("guard").** The answer includes a probability for every move. If the model's top move would crash, the game plays its most likely safe move instead. `--no-guard` turns this off.
-4. **Display.** A PyGame window (or `--headless`). The game runs at the model's pace, up to the `--fps` limit. The status bar shows the score, the move played, the model's confidence and the time each decision took.
+4. **Loop breaker.** The model always gives the same answer for the same board, so once the snake returns to a position it has been in since it last ate, it would repeat the same cycle forever. When the model's move (after the guard) would do that, the game plays the safe move into the position visited least often, with ties going to the model's ranking. `--no-loop-break` turns this off. The status bar shows `[loop]` when this happens.
+5. **Display.** A PyGame window (or `--headless`). The game runs at the model's pace, up to the `--fps` limit. The status bar shows the score, the move played, the model's confidence and the time each decision took.
 
 A game also ends if the snake goes 2·N·M moves without eating. This stops a model that loops forever.
 
