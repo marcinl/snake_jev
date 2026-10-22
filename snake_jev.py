@@ -27,6 +27,7 @@ import sys
 import time
 import urllib.request
 from dataclasses import dataclass, field
+from typing import Callable
 
 #DEFAULT_MODEL = "nimble:9b-q4_K_M" #"tev1:0.8b"
 DEFAULT_MODEL = "hf.co/ggml-org/vllm-d3-edge-GGUF:BF16"
@@ -180,6 +181,10 @@ class Game:
         if not future.alive:
             return 0
         return len(future._head_region()) - 1
+
+    def revisits(self, move: str) -> bool:
+        """Whether `move` puts the head on a (cell, heading) it already had since the last food."""
+        return self.outcome(move) != "food" and (self.next_head(move), self.effective(move)) in self._route
 
     def render_ascii(self) -> str:
         grid = [["." for _ in range(self.cols)] for _ in range(self.rows)]
@@ -348,6 +353,7 @@ class Decision:
     latency_ms: float
     overridden: bool
     from_lookahead: bool = False  # answered by the previous request, no new call
+    source: str = "model"  # which layer picked the move: "model", "ddqn" or "search"
 
 
 @dataclass
@@ -486,12 +492,29 @@ def choose_move(
     return model_choice, False  # no safe move: doomed either way
 
 
+def hybrid_move(game: Game, answer: dict, ddqn: Callable[[Game], list[str]]) -> tuple[str, str]:
+    """Pick a move as d3-edge, then the DDQN, then search (DDQN.md section 9); returns (move, source).
+
+    Every layer's move must keep the tail reachable. The DDQN is deterministic
+    too, so it may not revisit a position since the last food either;
+    otherwise it could circle as the model does.
+    """
+    model_choice = answer["choice"]
+    if not game.looped and game.is_safe(model_choice) and game.tail_reachable(model_choice):
+        return model_choice, "model"
+    for move in ddqn(game):
+        if game.is_safe(move) and game.tail_reachable(move) and not game.revisits(move):
+            return move, "ddqn"
+    return search_move(game), "search"
+
+
 class Player:
     """Turns game states into moves, reusing a lookahead answer when it applies."""
 
     def __init__(
         self, client: JevClient, assist: bool = True, guard: bool = True,
         compact: bool = False, lookahead: bool = False, tail_guard: bool = False,
+        ddqn: Callable[[Game], list[str]] | None = None,
     ) -> None:
         self.client = client
         self.assist = assist
@@ -499,6 +522,7 @@ class Player:
         self.compact = compact
         self.lookahead = lookahead
         self.tail_guard = tail_guard
+        self.ddqn = ddqn  # ranks moves, best first; replaces the guard with hybrid_move
         # (state key the answer was computed for, Choice answer)
         self._followup: tuple[tuple, dict] | None = None
 
@@ -512,7 +536,7 @@ class Player:
             # The guard still checks it against the real board.
             return make_decision(
                 game, followup[1], self.guard, latency_ms=0.0, from_lookahead=True,
-                tail_guard=self.tail_guard,
+                tail_guard=self.tail_guard, ddqn=self.ddqn,
             )
 
         t0 = time.perf_counter()
@@ -521,7 +545,9 @@ class Player:
         )
         latency_ms = (time.perf_counter() - t0) * 1000
         answers = response["answers"]
-        decision = make_decision(game, answers["move"], self.guard, latency_ms, tail_guard=self.tail_guard)
+        decision = make_decision(
+            game, answers["move"], self.guard, latency_ms, tail_guard=self.tail_guard, ddqn=self.ddqn
+        )
         # Keyed on the move actually played, which may be a guard override.
         played = game.effective(decision.move)
         if f"move_after_{played}" in answers and game.outcome(decision.move) == "free":
@@ -531,9 +557,14 @@ class Player:
 
 def make_decision(
     game: Game, answer: dict, guard: bool, latency_ms: float, from_lookahead: bool = False,
-    tail_guard: bool = False,
+    tail_guard: bool = False, ddqn: Callable[[Game], list[str]] | None = None,
 ) -> Decision:
-    move, overridden = choose_move(game, answer, guard, tail_guard)
+    if ddqn:
+        move, source = hybrid_move(game, answer, ddqn)
+        overridden = source != "model"
+    else:
+        move, overridden = choose_move(game, answer, guard, tail_guard)
+        source = "model"
     return Decision(
         move=move,
         model_choice=answer["choice"],
@@ -542,6 +573,7 @@ def make_decision(
         latency_ms=latency_ms,
         overridden=overridden,
         from_lookahead=from_lookahead,
+        source=source,
     )
 
 
@@ -630,7 +662,24 @@ class SearchPlayer:
         move = search_move(game)
         return Decision(
             move=move, model_choice=move, probabilities={}, confidence=1.0,
-            latency_ms=(time.perf_counter() - t0) * 1000, overridden=False,
+            latency_ms=(time.perf_counter() - t0) * 1000, overridden=False, source="search",
+        )
+
+
+class DDQNPlayer:
+    """Plays the DDQN's top move every tick, with no safety checks: a baseline for comparisons."""
+
+    label = "ddqn"
+
+    def __init__(self, ddqn: Callable[[Game], list[str]]) -> None:
+        self.ddqn = ddqn
+
+    def decide(self, game: Game) -> Decision:
+        t0 = time.perf_counter()
+        move = self.ddqn(game)[0]
+        return Decision(
+            move=move, model_choice=move, probabilities={}, confidence=1.0,
+            latency_ms=(time.perf_counter() - t0) * 1000, overridden=False, source="ddqn",
         )
 
 
@@ -641,12 +690,14 @@ class ModelStats:
     decisions: int = 0
     unchanged: int = 0  # the model's own choice was played; the guard didn't step in
     agrees_with_search: int = 0
+    sources: collections.Counter = field(default_factory=collections.Counter)
 
     def record(self, game: Game, decision: Decision) -> None:
         # Call before game.step: search is asked about the same position the model saw.
         self.decisions += 1
         self.unchanged += not decision.overridden
         self.agrees_with_search += decision.model_choice == search_move(game)
+        self.sources[decision.source] += 1
 
     def summary(self, player: Player) -> str:
         def share(n: int) -> str:
@@ -658,11 +709,17 @@ class ModelStats:
         if player.lookahead:
             prompt.append("lookahead")
         guard = "off" if not player.guard else "tail" if player.tail_guard else "cell"
-        return (
+        if player.ddqn:
+            guard = "hybrid (ddqn, search)"
+        text = (
             f"model {player.label} | prompt: {', '.join(prompt)} | guard: {guard}\n"
             f"  model's move played unchanged: {share(self.unchanged)}\n"
             f"  model's choice matches search: {share(self.agrees_with_search)}"
         )
+        if player.ddqn:
+            # If the model's share is low, d3-edge isn't really playing the game.
+            text += "\n  sources: " + " ".join(f"{s}={share(self.sources[s])}" for s in ("model", "ddqn", "search"))
+        return text
 
 
 def starved(game: Game) -> bool:
@@ -675,7 +732,7 @@ def starved(game: Game) -> bool:
 # --------------------------------------------------------------------------
 
 
-def run_headless(game: Game, player: Player | SearchPlayer, args: argparse.Namespace) -> None:
+def run_headless(game: Game, player: Player | SearchPlayer | DDQNPlayer, args: argparse.Namespace) -> None:
     overrides, decisions, latencies = 0, 0, []
     stats = ModelStats() if isinstance(player, Player) else None
     while game.alive and not starved(game):
@@ -690,7 +747,7 @@ def run_headless(game: Game, player: Player | SearchPlayer, args: argparse.Names
         if args.verbose:
             print(game.render_ascii())
             took = "lookahead" if d.from_lookahead else f"{d.latency_ms:.0f}ms"
-            print(f"model={d.model_choice} played={d.move} conf={d.confidence:.2f} {took}\n")
+            print(f"model={d.model_choice} played={d.move} source={d.source} conf={d.confidence:.2f} {took}\n")
     avg = sum(latencies) / len(latencies) if latencies else 0
     print(
         f"score={game.score} length={len(game.snake)} decisions={decisions} requests={len(latencies)} "
@@ -700,7 +757,7 @@ def run_headless(game: Game, player: Player | SearchPlayer, args: argparse.Names
         print(stats.summary(player))
 
 
-def run_pygame(game: Game, player: Player | SearchPlayer, args: argparse.Namespace) -> None:
+def run_pygame(game: Game, player: Player | SearchPlayer | DDQNPlayer, args: argparse.Namespace) -> None:
     import pygame  # imported lazily so headless mode and tests don't need it
 
     cell, hud = args.cell, 28
@@ -777,6 +834,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="guard also rejects moves after which the head can't reach the tail")
     p.add_argument("--search-only", action="store_true",
                    help="play with BFS search alone, no model (a baseline; Ollama not needed)")
+    p.add_argument("--ddqn", metavar="WEIGHTS",
+                   help="trained DDQN weights (.npz from ddqn.py): play d3-edge, then DDQN, then search")
+    p.add_argument("--ddqn-only", action="store_true",
+                   help="play the DDQN in --ddqn alone, no model or safety checks (a baseline)")
     p.add_argument("--headless", action="store_true")
     p.add_argument("--verbose", action="store_true", help="headless: print every frame")
     p.add_argument("--dump", action="store_true", help="print the first request JSON and exit")
@@ -796,6 +857,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             p.error(f"--{flag} needs the hints; it can't be combined with --no-assist")
     if args.tail_guard and not args.guard:
         p.error("--tail-guard can't be combined with --no-guard")
+    if args.ddqn and not args.guard:
+        p.error("--ddqn replaces the guard; it can't be combined with --no-guard")
+    if args.ddqn_only and not args.ddqn:
+        p.error("--ddqn-only needs the weights to play: --ddqn WEIGHTS")
+    if args.ddqn_only and args.search_only:
+        p.error("--ddqn-only and --search-only are separate baselines; pick one")
     return args
 
 
@@ -808,10 +875,20 @@ def main(argv: list[str] | None = None) -> None:
     if args.dump:
         print(json.dumps(build_request(game, args.model, args.assist, args.compact, args.lookahead), indent=2))
         return
+    ddqn = None
+    if args.ddqn:
+        # Imported only here so the game itself doesn't need numpy.
+        import ddqn as ddqn_module
+
+        net = ddqn_module.QNetwork.load(args.ddqn)
+        ddqn = lambda g: ddqn_module.rank_moves(net, g)  # noqa: E731
+    player: Player | SearchPlayer | DDQNPlayer
     if args.search_only:
-        player: Player | SearchPlayer = SearchPlayer()
+        player = SearchPlayer()
+    elif args.ddqn_only:
+        player = DDQNPlayer(ddqn)
     else:
-        player = Player(client, args.assist, args.guard, args.compact, args.lookahead, args.tail_guard)
+        player = Player(client, args.assist, args.guard, args.compact, args.lookahead, args.tail_guard, ddqn)
     try:
         (run_headless if args.headless else run_pygame)(game, player, args)
     except OSError as exc:  # URLError subclasses OSError

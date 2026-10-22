@@ -6,8 +6,9 @@ import unittest
 from unittest import mock
 
 from snake_jev import (
-    Decision, Game, JevClient, ModelStats, Player, SearchPlayer, bfs_path, build_request, choose_move,
-    main, parse_args, run_headless, safe_food_path, search_move, starved, timing_summary,
+    Decision, DDQNPlayer, Game, JevClient, ModelStats, Player, SearchPlayer, bfs_path, build_request,
+    choose_move, hybrid_move, main, parse_args, run_headless, safe_food_path, search_move, starved,
+    timing_summary,
 )
 
 
@@ -504,6 +505,73 @@ class ModelStatsTests(unittest.TestCase):
         text = out.getvalue()
         self.assertIn("model fake | prompt: hints, full board | guard: cell", text)
         self.assertIn("model's choice matches search:", text)
+        self.assertNotIn("sources:", text)  # only reported with --ddqn
+
+
+def ranker(*moves: str):
+    """Stands in for a trained DDQN: always ranks the moves in this order."""
+    return lambda game: list(moves)
+
+
+def looped_game() -> Game:
+    """Head back on its start position (3,2) heading RIGHT; route DOWN, LEFT, UP, RIGHT."""
+    g = make_game()
+    g.food = (0, 0)
+    for move in ("DOWN", "LEFT", "UP", "RIGHT"):
+        g.step(move)
+    return g
+
+
+class HybridTests(unittest.TestCase):
+    def test_model_plays_a_tail_safe_move(self) -> None:
+        self.assertEqual(hybrid_move(pocket_game(), answer_for("RIGHT"), ranker("LEFT")), ("RIGHT", "model"))
+
+    def test_ddqn_takes_over_from_a_move_into_a_pocket(self) -> None:
+        # The DDQN's own first choice is the pocket too, so its next one is played.
+        self.assertEqual(
+            hybrid_move(pocket_game(), answer_for("LEFT"), ranker("LEFT", "UP", "RIGHT")), ("RIGHT", "ddqn")
+        )
+
+    def test_ddqn_plays_once_the_route_repeats(self) -> None:
+        g = looped_game()
+        self.assertTrue(g.looped)
+        # RIGHT is safe and new, but the model has had its chance since the last food.
+        self.assertEqual(hybrid_move(g, answer_for("RIGHT"), ranker("UP", "RIGHT")), ("UP", "ddqn"))
+
+    def test_search_when_the_ddqn_would_revisit(self) -> None:
+        g = make_game()
+        g.food = (0, 0)
+        for move in ("DOWN", "LEFT", "UP"):
+            g.step(move)  # head (2,2) heading UP; RIGHT returns to the start position
+        self.assertTrue(g.revisits("RIGHT"))
+        self.assertFalse(g.revisits("UP"))
+        self.assertEqual(hybrid_move(g, answer_for("DOWN"), ranker("RIGHT")), (search_move(g), "search"))
+
+    def test_player_records_the_source(self) -> None:
+        player = Player(FakeClient({"move": answer("LEFT")}), ddqn=ranker("LEFT", "UP", "RIGHT"))
+        d = player.decide(pocket_game())
+        self.assertEqual((d.move, d.model_choice, d.overridden, d.source), ("RIGHT", "LEFT", True, "ddqn"))
+
+    def test_summary_shows_source_shares(self) -> None:
+        stats = ModelStats()
+        g = pocket_game()
+        for source in ("model", "model", "ddqn", "search"):
+            stats.record(g, Decision(move="RIGHT", model_choice="RIGHT", probabilities={}, confidence=0.0,
+                                     latency_ms=0.0, overridden=source != "model", source=source))
+        summary = stats.summary(Player(FakeClient({}), ddqn=ranker("UP")))
+        self.assertIn("guard: hybrid (ddqn, search)", summary)
+        self.assertIn("sources: model=2/4 (50%) ddqn=1/4 (25%) search=1/4 (25%)", summary)
+
+    def test_ddqn_player_plays_the_top_move_unchecked(self) -> None:
+        d = DDQNPlayer(ranker("UP", "RIGHT")).decide(pocket_game())  # UP is the wall
+        self.assertEqual((d.move, d.source), ("UP", "ddqn"))
+
+    def test_ddqn_flag_combinations(self) -> None:
+        for argv in (["--ddqn", "w.npz", "--no-guard"], ["--ddqn-only"],
+                     ["--ddqn", "w.npz", "--ddqn-only", "--search-only"]):
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit):
+                parse_args(argv)
 
 
 if __name__ == "__main__":

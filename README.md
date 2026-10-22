@@ -33,6 +33,8 @@ python3 snake_jev.py --cols 20 --rows 15
 | `--no-guard` | off | Always play the model's top choice, even if it crashes |
 | `--tail-guard` | off | The guard also rejects moves after which the head can no longer reach the tail (see step 3 below) |
 | `--search-only` | off | Play with BFS search alone, without the model or Ollama: a baseline to compare the model against |
+| `--ddqn WEIGHTS` | off | Hybrid controller: the model, then the trained DDQN, then search (see [DDQN layer](#ddqn-layer)) |
+| `--ddqn-only` | off | With `--ddqn`: play the DDQN alone, without the model, Ollama or any safety check: a baseline |
 | `--headless` | off | Console only, no PyGame window; prints a summary line |
 | `--verbose` | off | Headless: print every frame and decision |
 | `--dump` | off | Print the request for the first tick and exit |
@@ -45,7 +47,7 @@ python3 snake_jev.py --cols 20 --rows 15
 
 In the window, **R** restarts after game over and **Esc** quits.
 
-Run the tests (no Ollama or pygame needed):
+Run the tests (no Ollama or pygame needed; `test_ddqn.py` needs numpy from `requirements-ddqn.txt`):
 
 ```bash
 python3 -m unittest -v
@@ -75,6 +77,36 @@ model hf.co/ggml-org/vllm-d3-edge-GGUF:BF16 | prompt: hints, compact | guard: ta
 - The first line records the prompt and guard settings, so runs with different prompts can be compared side by side.
 
 **Search baseline (`--search-only`).** No model is involved. Each tick it takes the shortest path to the food, but only if the head could still reach the tail after eating. Otherwise it follows its tail the long way round until a safe path opens. Over 5 seeds it filled the board (a win) 3 times on 10×8 and once on 20×15; the other games ended 2–8 cells short of a full board, on the starvation limit. None crashed. It is meant as the last-resort layer of a hybrid controller, and as the bar the model has to beat.
+
+### DDQN layer
+
+`DDQN.md` explains the design. Train it offline (no Ollama), then play the hybrid controller:
+
+```bash
+pip install -r requirements-ddqn.txt
+python3 ddqn.py --episodes 1500 --seed 0 --out ddqn_weights.npz   # about 1 minute on a laptop
+python3 snake_jev.py --ddqn ddqn_weights.npz --headless --cols 10 --rows 8
+```
+
+With `--ddqn`, each tick plays d3-edge's move if the route since the last apple is new and the move keeps the tail reachable. Otherwise it plays the DDQN's highest-Q move that keeps the tail reachable and doesn't revisit a position, and otherwise search. This replaces the guard, so `--tail-guard` has no effect. The summary adds `sources: model=… ddqn=… search=…`. If `model` falls low, d3-edge isn't really playing the game.
+
+The 1,500-episode run above (seed 0) reached a mean score of about 15 per episode by the end of training. Played alone (`--ddqn-only`, no safety checks), over seeds 0–19:
+
+| Board | DDQN alone | Search alone |
+|---|---|---|
+| 10×8 | mean 36.8; crashed 16, starved 4 | mean 76.8; won 9, starved 11 |
+| 20×15 | mean 69.2; crashed 20 | mean 296.2; won 6, starved 14 |
+
+The DDQN alone is far weaker than search: it only sees local features and has no tail check (see `DDQN.md` section 10). It is meant to be the middle layer, not to play alone.
+
+One game with d3-edge (`--compact`, 10×8, seed 0) each way:
+
+| Setup | Result |
+|---|---|
+| `--ddqn` (hybrid) | Score 72 of a possible 78, 1,634 moves; sources model 78%, DDQN 18%, search 4% |
+| `--tail-guard` (no DDQN) | Score 78, a full board (win), 2,138 moves; model's move played 82% |
+
+In this one game the DDQN layer did worse than the existing tail guard. A single game is not a benchmark, so compare over many seeds before drawing conclusions.
 
 ## What gets sent to the model each tick
 
@@ -194,8 +226,11 @@ Before, the model answered UP almost every tick. The guard's fallback then drove
 | File | Contents |
 |---|---|
 | `snake_jev.py` | Game logic, query building, Ollama client, guard, PyGame and headless front ends |
-| `test_snake_jev.py` | Unit tests for game rules, request shape, guard, lookahead and timing |
+| `test_snake_jev.py` | Unit tests for game rules, request shape, guard, hybrid controller, lookahead and timing |
+| `ddqn.py` | Double DQN in numpy: features, rewards, network, training; design in `DDQN.md` |
+| `test_ddqn.py` | Unit tests for the DDQN, including the worked examples from `DDQN.md` |
 | `requirements.txt` | `pygame-ce` |
+| `requirements-ddqn.txt` | `numpy`, for `ddqn.py` and `--ddqn` |
 
 ## References
 
