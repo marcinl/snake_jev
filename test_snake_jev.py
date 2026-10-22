@@ -6,7 +6,8 @@ import unittest
 from unittest import mock
 
 from snake_jev import (
-    Game, JevClient, Player, build_request, choose_move, parse_args, timing_summary,
+    Decision, Game, JevClient, ModelStats, Player, SearchPlayer, bfs_path, build_request, choose_move,
+    main, parse_args, run_headless, safe_food_path, search_move, starved, timing_summary,
 )
 
 
@@ -65,6 +66,18 @@ class GameTests(unittest.TestCase):
         g.food = (5, 0)  # head at (3,2)
         self.assertEqual(g.food_relative(), "food is 2 row(s) UP and 2 column(s) RIGHT from the head")
 
+    def test_move_hints_say_whether_the_move_nears_the_food(self) -> None:
+        g = make_game()
+        g.snake = [(5, 2), (4, 2)]  # facing the right wall, head at (5,2)
+        g.food = (5, 0)
+        self.assertEqual(
+            g.describe_moves(),
+            "UP: free, towards the food; DOWN: free, away from the food; "
+            "LEFT: not allowed (reverse); RIGHT: wall, game over",
+        )
+        g.food = (5, 1)
+        self.assertEqual(g.move_hint("UP"), "food, eats it")
+
 
 class QueryTests(unittest.TestCase):
     def test_request_shape_and_text_only_state(self) -> None:
@@ -76,8 +89,17 @@ class QueryTests(unittest.TestCase):
         self.assertEqual(set(move["criteria"]), {"UP", "DOWN", "LEFT", "RIGHT"})
 
     def test_no_assist_omits_hints(self) -> None:
-        state = build_request(make_game(), "m", assist=False)["state"]
-        self.assertNotIn("next_cell", state)
+        req = build_request(make_game(), "m", assist=False)
+        self.assertNotIn("next_cell", req["state"])
+        self.assertEqual(req["questions"]["move"]["criteria"]["UP"], "Move the head one row up")
+
+    def test_criteria_repeat_the_move_hints(self) -> None:
+        g = make_game()
+        g.food = (3, 0)  # straight UP from the head at (3,2)
+        criteria = build_request(g, "m")["questions"]["move"]["criteria"]
+        self.assertEqual(criteria["UP"], "Move the head one row up: free, towards the food")
+        self.assertEqual(criteria["DOWN"], "Move the head one row down: free, away from the food")
+        self.assertEqual(criteria["LEFT"], "Move the head one column left: not allowed (reverse)")
 
     def test_static_fields_come_first(self) -> None:
         for compact in (False, True):
@@ -121,6 +143,13 @@ class LookaheadRequestTests(unittest.TestCase):
         hint = build_request(g, "m", lookahead=True)["state"]["if_head_moves_UP"]
         self.assertIn("moving UP", hint)
         self.assertIn("food is 1 row(s) UP and 2 column(s) RIGHT", hint)
+
+    def test_branch_criteria_describe_the_next_position(self) -> None:
+        g = make_game()
+        g.food = (3, 0)  # head at (3,2); after UP the food is one cell further UP
+        criteria = build_request(g, "m", lookahead=True)["questions"]["move_after_UP"]["criteria"]
+        self.assertEqual(criteria["UP"], "Move the head one row up: food, eats it")
+        self.assertEqual(criteria["DOWN"], "Move the head one row down: not allowed (reverse)")
 
     def test_peek_leaves_real_game_untouched(self) -> None:
         g = make_game()
@@ -250,6 +279,231 @@ class GuardTests(unittest.TestCase):
         # LEFT is a reverse, so the guard skips it and takes DOWN.
         self.assertEqual(choose_move(g, answer), ("DOWN", True))
         self.assertEqual(choose_move(g, answer, guard=False), ("RIGHT", False))
+
+    def test_tail_guard_rejects_move_into_pocket(self) -> None:
+        g = pocket_game()
+        # LEFT heads for the food but into the pocket; plain guard allows it.
+        self.assertEqual(choose_move(g, answer_for("LEFT")), ("LEFT", False))
+        self.assertEqual(choose_move(g, answer_for("LEFT"), tail_guard=True), ("RIGHT", True))
+
+    def test_tail_guard_keeps_a_tail_safe_choice(self) -> None:
+        self.assertEqual(choose_move(pocket_game(), answer_for("RIGHT"), tail_guard=True), ("RIGHT", False))
+
+    def test_tail_guard_picks_most_room_when_all_moves_trap(self) -> None:
+        g = trapped_game()
+        self.assertEqual(choose_move(g, answer_for("RIGHT"), tail_guard=True), ("LEFT", True))
+        self.assertEqual(choose_move(g, answer_for("RIGHT")), ("RIGHT", False))
+
+    def test_player_applies_tail_guard(self) -> None:
+        g = pocket_game()
+        d = Player(FakeClient({"move": answer("LEFT")}), tail_guard=True).decide(g)
+        self.assertEqual((d.move, d.model_choice, d.overridden), ("RIGHT", "LEFT", True))
+
+    def test_guard_hands_a_repeated_route_to_search(self) -> None:
+        g = make_game()  # head (3,2) heading RIGHT
+        g.food = (0, 0)
+        for move in ("DOWN", "LEFT", "UP", "RIGHT"):
+            g.step(move)
+        self.assertTrue(g.route_repeated)
+        # RIGHT is safe, so without the loop check the guard would keep it.
+        self.assertEqual(choose_move(g, answer_for("RIGHT")), (search_move(g), True))
+        self.assertEqual(choose_move(g, answer_for("RIGHT"), guard=False), ("RIGHT", False))
+
+    def test_up_only_model_escapes_the_corner_cycle(self) -> None:
+        # Reproduces the cycle between the top-right and bottom-right corners:
+        # a model that always answers UP, food near the bottom-left corner.
+        # The fallback order is the one the real model showed.
+        up_first = {"choice": "UP", "probabilities": {"UP": 0.5, "DOWN": 0.25, "RIGHT": 0.15, "LEFT": 0.1}}
+        g = Game(20, 15, rng=random.Random(0))
+        g.snake = [(10 + i, 0) for i in range(4)]
+        g.heading = "LEFT"
+        g.food = (2, 12)
+        player = Player(FakeClient({"move": up_first}))
+        while g.score == 0 and g.alive and not starved(g):
+            g.step(player.decide(g).move)
+        self.assertEqual(g.score, 1)
+
+    def test_tail_guard_rejects_no_guard(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parse_args(["--tail-guard", "--no-guard"])
+
+
+def answer_for(choice: str) -> dict:
+    # The other moves get small, distinct probabilities so the guard's fallback order is fixed.
+    probs = {"UP": 0.03, "DOWN": 0.02, "LEFT": 0.01, "RIGHT": 0.04}
+    probs[choice] = 0.9
+    return {"choice": choice, "probabilities": probs}
+
+
+def pocket_game() -> Game:
+    """Head at the top of a body wall: LEFT enters a closed pocket, RIGHT doesn't.
+
+        #F.H...#
+        #..S...#
+        #..SST.#
+    """
+    g = make_game(6, 3)
+    g.snake = [(2, 0), (2, 1), (2, 2), (3, 2), (4, 2)]
+    g.heading = "UP"
+    g.food = (0, 0)
+    return g
+
+
+def trapped_game() -> Game:
+    """Both safe moves lose the tail: LEFT leaves 7 cells, RIGHT 1.
+
+        #F.SST#
+        #..SSS#
+        #..SSS#
+        #..H..#
+    """
+    g = make_game(5, 4)
+    g.snake = [(2, 3), (2, 2), (2, 1), (2, 0), (3, 0), (3, 1), (3, 2), (4, 2), (4, 1), (4, 0)]
+    g.heading = "DOWN"
+    g.food = (0, 0)
+    return g
+
+
+class SafetyHelperTests(unittest.TestCase):
+    def test_tail_reachable_detects_pocket(self) -> None:
+        g = pocket_game()
+        self.assertFalse(g.tail_reachable("LEFT"))
+        self.assertTrue(g.tail_reachable("RIGHT"))
+        self.assertFalse(g.tail_reachable("UP"))  # wall
+
+    def test_free_space_counts_region_after_move(self) -> None:
+        g = pocket_game()
+        self.assertEqual(g.free_space("LEFT"), 5)  # columns 0-1 minus the head
+        self.assertEqual(g.free_space("RIGHT"), 8)  # columns 3-5, the vacated tail cell included
+        self.assertEqual(g.free_space("UP"), 0)
+
+    def test_trapped_position(self) -> None:
+        g = trapped_game()
+        self.assertEqual([m for m in ("LEFT", "RIGHT") if g.tail_reachable(m)], [])
+        self.assertEqual((g.free_space("LEFT"), g.free_space("RIGHT")), (7, 1))
+
+    def test_open_board_tail_always_reachable(self) -> None:
+        g = make_game()
+        g.food = (0, 0)
+        self.assertTrue(all(g.tail_reachable(m) for m in ("UP", "DOWN", "RIGHT")))
+
+    def test_helpers_leave_game_untouched(self) -> None:
+        g = pocket_game()
+        before = g.state_key()
+        g.tail_reachable("LEFT")
+        g.free_space("RIGHT")
+        self.assertEqual(g.state_key(), before)
+
+    def test_route_repeated_after_a_loop(self) -> None:
+        g = make_game()  # head (3,2) heading RIGHT
+        g.food = (0, 0)
+        for move in ("DOWN", "LEFT", "UP"):
+            g.step(move)
+            self.assertFalse(g.route_repeated)
+        g.step("RIGHT")  # back on (3,2) heading RIGHT
+        self.assertTrue(g.route_repeated)
+        g.step("RIGHT")  # (4,2) RIGHT is new
+        self.assertFalse(g.route_repeated)
+        self.assertTrue(g.looped)  # stays set until the next food
+
+    def test_route_resets_on_food(self) -> None:
+        g = make_game()
+        g.food = (0, 0)
+        for move in ("DOWN", "LEFT", "UP"):
+            g.step(move)
+        g.food = (3, 2)
+        g.step("RIGHT")  # same position as the start, but it eats
+        self.assertFalse(g.route_repeated)
+        self.assertFalse(g.looped)
+        self.assertEqual(g.score, 1)
+
+
+class SearchTests(unittest.TestCase):
+    def test_bfs_straight_line(self) -> None:
+        g = make_game()  # head (3,2) heading RIGHT
+        self.assertEqual(bfs_path(g, (5, 2)), ["RIGHT", "RIGHT"])
+
+    def test_bfs_never_starts_with_a_reverse(self) -> None:
+        g = make_game()
+        path = bfs_path(g, (1, 2))  # straight behind the tail at (2,2)
+        self.assertEqual(len(path), 4)
+        self.assertNotEqual(path[0], "LEFT")
+
+    def test_bfs_none_when_walled_off(self) -> None:
+        future = pocket_game().peek("LEFT")  # head now inside the pocket
+        self.assertIsNone(bfs_path(future, (5, 0)))
+
+    def test_food_path_rejected_when_eating_traps_the_tail(self) -> None:
+        g = pocket_game()  # food (0,0) is in the pocket
+        self.assertEqual(bfs_path(g, g.food), ["LEFT", "LEFT"])
+        self.assertIsNone(safe_food_path(g))
+        self.assertEqual(search_move(g), "RIGHT")  # stalls on the open side instead
+
+    def test_search_takes_safe_food_path(self) -> None:
+        g = make_game()
+        g.food = (5, 2)
+        self.assertEqual(safe_food_path(g), ["RIGHT", "RIGHT"])
+        self.assertEqual(search_move(g), "RIGHT")
+
+    def test_search_last_resort_picks_most_room(self) -> None:
+        self.assertEqual(search_move(trapped_game()), "LEFT")
+
+    def test_search_never_crashes_on_small_board(self) -> None:
+        wins = 0
+        for seed in range(10):
+            g = Game(6, 4, rng=random.Random(seed))
+            player = SearchPlayer()
+            while g.alive and not starved(g):
+                g.step(player.decide(g).move)
+            crashed = not g.alive and g.food is not None
+            self.assertFalse(crashed, f"seed {seed}")
+            wins += g.food is None
+        self.assertGreaterEqual(wins, 5)
+
+    def test_search_only_runs_without_ollama(self) -> None:
+        out = io.StringIO()
+        with mock.patch("snake_jev.urllib.request.urlopen", side_effect=AssertionError("no requests")), \
+                contextlib.redirect_stdout(out):
+            main(["--search-only", "--headless", "--cols", "6", "--rows", "4", "--seed", "0"])
+        self.assertIn("score=22", out.getvalue())
+        self.assertNotIn("played unchanged", out.getvalue())  # nothing to report without a model
+
+
+def decision(choice: str, overridden: bool = False) -> Decision:
+    return Decision(move=choice, model_choice=choice, probabilities={}, confidence=0.0,
+                    latency_ms=0.0, overridden=overridden)
+
+
+class ModelStatsTests(unittest.TestCase):
+    def test_counts_unchanged_and_search_agreement(self) -> None:
+        g = pocket_game()  # search plays RIGHT here
+        stats = ModelStats()
+        stats.record(g, decision("LEFT"))
+        stats.record(g, decision("RIGHT"))
+        stats.record(g, decision("UP", overridden=True))
+        self.assertEqual((stats.decisions, stats.unchanged, stats.agrees_with_search), (3, 2, 1))
+
+    def test_summary_shows_shares_and_settings(self) -> None:
+        stats = ModelStats(decisions=4, unchanged=3, agrees_with_search=1)
+        player = Player(FakeClient({}), compact=True, tail_guard=True)
+        self.assertEqual(stats.summary(player), (
+            "model fake | prompt: hints, compact | guard: tail\n"
+            "  model's move played unchanged: 3/4 (75%)\n"
+            "  model's choice matches search: 1/4 (25%)"
+        ))
+
+    def test_summary_with_no_decisions(self) -> None:
+        self.assertIn("0/0 (0%)", ModelStats().summary(Player(FakeClient({}))))
+
+    def test_headless_prints_stats_for_model_games(self) -> None:
+        g = make_game()
+        args = parse_args(["--headless"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            run_headless(g, Player(FakeClient({"move": answer("UP")})), args)
+        text = out.getvalue()
+        self.assertIn("model fake | prompt: hints, full board | guard: cell", text)
+        self.assertIn("model's choice matches search:", text)
 
 
 if __name__ == "__main__":

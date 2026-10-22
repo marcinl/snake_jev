@@ -31,6 +31,8 @@ python3 snake_jev.py --cols 20 --rows 15
 | `--host` | `http://localhost:11434` | Ollama server |
 | `--no-assist` | off | Send only the raw board, without the hints the game works out |
 | `--no-guard` | off | Always play the model's top choice, even if it crashes |
+| `--tail-guard` | off | The guard also rejects moves after which the head can no longer reach the tail (see step 3 below) |
+| `--search-only` | off | Play with BFS search alone, without the model or Ollama: a baseline to compare the model against |
 | `--headless` | off | Console only, no PyGame window; prints a summary line |
 | `--verbose` | off | Headless: print every frame and decision |
 | `--dump` | off | Print the request for the first tick and exit |
@@ -54,9 +56,25 @@ python3 -m unittest -v
 1. **Game logic (no model involved).** An N columns × M rows grid. The snake starts with length 2, with its head at `(N//2, M//2)`, its tail one cell to the left, and heading RIGHT. Food spawns on a random free cell. Reverse moves are ignored, as in classic Snake.
 2. **Each game tick.** Build a text description of the board, send one `POST /v1/systemone` request, and get back a typed `choice` answer.
 3. **Safety check ("guard").** The answer includes a probability for every move. If the model's top move would crash, the game plays its most likely safe move instead. `--no-guard` turns this off.
+   **Loop breaker.** If the head comes back to a cell it already visited since the last food, with the same heading, the snake is going round a cycle. The fallback above is deterministic, so a model that keeps giving the same answer would stay in that cycle until it starves. Search (see below) then plays every move until the snake eats, and these moves count as guard overrides. Search has to keep steering until the food: if the model takes over again as soon as the head leaves the old route, the same bias builds a new loop.
+   With `--tail-guard`, a move must also leave a path from the head to the tail. A move can be safe for one tick and still enter a dead-end pocket. While the tail is reachable, following it is always a way out. If every safe move cuts the tail off, the guard plays the one that leaves the most free space.
 4. **Display.** A PyGame window (or `--headless`). The game runs at the model's pace, up to the `--fps` limit. The status bar shows the score, the move played, the model's confidence and the time each decision took.
 
-A game also ends if the snake goes 2·N·M moves without eating. This stops a model that loops forever.
+A game also ends if the snake goes 2·N·M moves without eating. With the guard on, the loop breaker normally gets there first; the limit matters for `--no-guard`.
+
+**End-of-game report.** After every model game, headless or in the window, the console shows how much of the game the model actually played:
+
+```
+model hf.co/ggml-org/vllm-d3-edge-GGUF:BF16 | prompt: hints, compact | guard: tail
+  model's move played unchanged: 130/299 (43%)
+  model's choice matches search: 49/299 (16%)
+```
+
+- *Played unchanged*: the model's top choice was played as-is; the rest of the time the guard replaced it.
+- *Matches search*: the model chose the move search would have played in the same position. This is a stricter test, since a move can be safe and still worse than search's.
+- The first line records the prompt and guard settings, so runs with different prompts can be compared side by side.
+
+**Search baseline (`--search-only`).** No model is involved. Each tick it takes the shortest path to the food, but only if the head could still reach the tail after eating. Otherwise it follows its tail the long way round until a safe path opens. Over 5 seeds it filled the board (a win) 3 times on 10×8 and once on 20×15; the other games ended 2–8 cells short of a full board, on the starvation limit. None crashed. It is meant as the last-resort layer of a hybrid controller, and as the bar the model has to beat.
 
 ## What gets sent to the model each tick
 
@@ -75,17 +93,17 @@ Jev only accepts text, so every value in `state` is a string. This is the first 
     "head_position": "column 4, row 3 (0-based, row 0 at top)",
     "food_position": "column 0, row 1",
     "food_relative_to_head": "food is 2 row(s) UP and 4 column(s) LEFT from the head",
-    "next_cell": "UP: free; DOWN: free; LEFT: not allowed (reverse); RIGHT: free"
+    "next_cell": "UP: free, towards the food; DOWN: free, away from the food; LEFT: not allowed (reverse); RIGHT: free, away from the food"
   },
   "questions": {
     "move": {
       "type": "choice",
       "instructions": "Which direction should the snake's head move next? Move towards the food and never into a wall or the snake's body.",
       "criteria": {
-        "UP": "Move the head one row up",
-        "DOWN": "Move the head one row down",
-        "LEFT": "Move the head one column left",
-        "RIGHT": "Move the head one column right"
+        "UP": "Move the head one row up: free, towards the food",
+        "DOWN": "Move the head one row down: free, away from the food",
+        "LEFT": "Move the head one column left: not allowed (reverse)",
+        "RIGHT": "Move the head one column right: free, away from the food"
       }
     }
   }
@@ -113,6 +131,7 @@ The response looks like this:
 
 - **How it scales with N × M:** the `board` field is (N+2)·(M+2) characters, so the input grows with board area. Everything else stays the same size.
 - **Hints:** `food_relative_to_head` and `next_cell` are worked out by the game, not the model. Small models are weak at reading positions off an ASCII grid; the hints turn the task into reading a sentence. `--no-assist` removes them.
+- **Criteria carry the hints too.** Each option's criterion repeats what that move does (`towards the food`, `away from the food`, `wall, game over`, …). The model scores options mostly by their criterion text. With the plain criteria ("Move the head one row up"), `hf.co/ggml-org/vllm-d3-edge-GGUF:BF16` answered UP in 58 of 60 random positions, whatever the hints said. `--no-assist` keeps the plain criteria.
 
 ## Speed
 
@@ -153,6 +172,17 @@ Measured on Ollama 0.35.1 with a 10×8 board:
 | Four yes/no ("Noul") questions per tick instead of one Choice | Always safe (30 of 30), but went towards the food less often (13 vs 16 of 30); not adopted |
 
 UP/DOWN/LEFT/RIGHT likely works better because the answer options then use the same words as the hints. The main limit now is the model's size, not how the question is asked.
+
+## Findings with `hf.co/ggml-org/vllm-d3-edge-GGUF:BF16`
+
+Measured on a 20×15 board, guard on, seeds 1–3:
+
+| Setup | Before (plain criteria, no loop breaker) | After |
+|---|---|---|
+| Full board | Score 0 in all 3 games; starved at 601 moves; model's move played 16–42% | Score 10 / 23 / 24; model's move played 93–94% |
+| `--compact` | Score 0 in all 3 games; starved at 601 moves; model's move played 33–47% | Score 30 / 9 / 20; model's move played 98% |
+
+Before, the model answered UP almost every tick. The guard's fallback then drove the snake round a fixed cycle between the top-right and bottom-right corners. On 60 random positions, putting the per-move hints into the criteria raised food-ward choices from 23 to 37 (full board) and from 24 to 50 (`--compact`). Without the board, the model picks the food-ward move more often in single positions. Over 3 games the scores are mixed, so more seeds are needed before calling `--compact` better.
 
 ## Implementation notes
 
